@@ -1,0 +1,48 @@
+config BOSCH_SYMSPI
+    tristate "Bosch Symmetrical SPI driver"
+    default n
+    depends on BOSCH_DRIVERS
+    ---help---
+        This driver provides symmetrical data transport
+        between SPI Master and SPI Slave, provided with
+        two additional handshaking lines between SPI Master
+        and SPI Slave.
+
+        Handshaking lines are handled via GPIO.
+
+        This driver is intended to be able to work on
+        either SPI Slave side or SPI Master side depending
+        on the configuration.
+
+        This driver is intended to support SPI Master mode
+        with hardware SPI_RDY support.
+
+        If unsure, say N.
+
+config BOSCH_SYMSPI_SPI_MASTER
+    bool "If we want to be SPI master using SymSPI"
+    default y
+    depends on BOSCH_SYMSPI
+    ---help---
+        If set to Y then SymSPI will configure
+        underlying SPI communication layer to
+        work as SPI master, otherwise - as a
+        slave.
+
+config BOSCH_SYMSPI_OUR_FLAG_INACTIVE_STATE_MINIMAL_TIME_USEC
+    int "Minimal time of our SymSPI flag line inactive state (us)"
+    default 800
+    depends on BOSCH_SYMSPI
+    ---help---
+        Sets the minimal time (in us) of our SymSPI flag
+        line to be in inactive state, this is used to
+        guarantee that the other side will be able to
+        handle our xfer request and will not drop it
+        due to software/hardware restrictions.
+
+config BOSCH_SYMSPI_TEST_MODULE
+    bool "If we want to enable the symspi test module"
+    default n
+    depends on BOSCH_SYMSPI
+    ---help---
+        This flag enables the SYMSPI test module.

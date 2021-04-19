@@ -72,6 +72,8 @@
 #define SYMSPI_ERROR_ISR_SETUP 15
 // error waiting other side reaction
 #define SYMSPI_ERROR_WAIT_OTHER_SIDE 16
+// error trying to create private work queue
+#define SYMSPI_ERROR_WORKQUEUE_INIT 17
 
 
 /* --------------------- DATA STRUCTS SECTION ---------------------------*/

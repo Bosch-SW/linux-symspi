@@ -33,6 +33,9 @@
 #include <linux/interrupt.h>
 #include <linux/delay.h>
 #include <linux/timekeeping.h>
+#include <linux/proc_fs.h>
+#include <linux/uaccess.h>
+
 
 // DEV STACK
 //
@@ -145,7 +148,17 @@
 //      say in 25 microseconds, instead of 10 milliseconds,
 //      triggering false positive timeout indication, in practice
 //      difference of 0.2ms instead of 10ms set was observed)
-#define SYMSPI_THEIR_FLAG_WAIT_TIMEOUT_MSEC 30
+//
+// NOTE: one more recomendation: set this value to high enough value
+//  	which would reasonably can be considered as "not-normal/
+//  	suspicious" delay which might indicate a hang or some lock,
+//  	so the other side can be "woken up"/purged using the SymSPI
+//  	error indication flag line oscillation. Too low value will
+//  	trigger unnecessary error recovery procedures which will slow
+//  	us down without a reason to do so.
+#ifndef SYMSPI_THEIR_FLAG_WAIT_TIMEOUT_MSEC
+#define SYMSPI_THEIR_FLAG_WAIT_TIMEOUT_MSEC 60
+#endif
 
 // The duration of the silence which immediately follows
 // the error recovery procedure (this is actually the time
@@ -159,6 +172,46 @@
 // on device closing (in milliseconds)
 #define SYMSPI_CLOSE_HW_WAIT_TIMEOUT_MSEC 500
 
+
+// Selects the workqueue to use to run operations ordered
+// from interrupt context.
+// Three options are available now:
+// * "SYMSPI_WQ_SYSTEM": see system_wq in workqueue.h.
+// * "SYMSPI_WQ_SYSTEM_HIGHPRI": see system_highpri_wq in
+//   workqueue.h.
+// * "SYMSPI_WQ_PRIVATE": use privately constructed high priority
+//   workqueue.
+//
+// NOTE: the selection of the workqueue depends on the
+//      generic considerations on SymSPI functioning
+//      within the overall system context. Say if SymSPI serves
+//      as a connection for an optional device, or device which
+//      can easily wait for some sec (in the worst case) to react
+//      then "SYMSPI_WQ_SYSTEM" workqeue is a nice option to select.
+//      On the other hand if no delays are allowed in handling SymSPI
+//      communication (say, to communicate to hardware watchdog)
+//      then "SYMSPI_WQ_SYSTEM_HIGHPRI" or "SYMSPI_WQ_PRIVATE" is
+//      surely more preferrable.
+//
+// Can be set via kernel config.
+#ifndef SYMSPI_WORKQUEUE_MODE
+#define SYMSPI_WORKQUEUE_MODE SYMSPI_WQ_PRIVATE
+#endif
+
+#define SYMSPI_WQ_SYSTEM 0
+#define SYMSPI_WQ_SYSTEM_HIGHPRI 1
+#define SYMSPI_WQ_PRIVATE 2
+
+// Comparator
+#define SYMSPI_WQ_MODE_MATCH(x)		\
+	SYMSPI_WORKQUEUE_MODE == SYMSPI_WQ_##x
+
+#ifndef SYMSPI_WORKQUEUE_MODE
+#error SYMSPI_WORKQUEUE_MODE must be defined to \
+		one of [SYMSPI_WQ_SYSTEM, SYMSPI_WQ_SYSTEM_HIGHPRI, \
+		SYMSPI_WQ_PRIVATE].
+#endif
+
 // Define this to work as SPI master (for now
 // SPI master is the only option).
 //
@@ -171,7 +224,9 @@
 // 2: + warnings
 // 3: (DEFAULT) + key info messages (info level 0)
 // 4: + optional info messages (info level 1)
-// 5: + all info messages (debug information) (info level 2)
+// 5: + debug check points (info level 2 == debug level 1)
+// 6: + trace level, print everything, will flood
+//      if communication is actively used.
 #define SYMSPI_VERBOSITY 3
 
 // The minimal time which must pass between repeated error is reported
@@ -189,6 +244,9 @@
 #define SYMSPI_ERR_RATE_DECAY_RATE_MIN 3
 
 /* --------------------- UTILITIES SECTION ----------------------------- */
+
+#define macro_val_str(s) stringify(s)
+#define stringify(s) #s
 
 #if SYMSPI_VERBOSITY >= 1
 #define symspi_err(fmt, ...)						\
@@ -246,6 +304,18 @@
 #define symspi_info_helper_2(fmt, ...)
 #define symspi_info_raw_helper_2(fmt, ...)
 #endif
+
+#if SYMSPI_VERBOSITY >= 6
+#define symspi_trace(fmt, ...)					\
+	pr_info(SYMSPI_LOG_PREFIX"%s: "fmt"\n", __func__		\
+		   , ##__VA_ARGS__)
+#define symspi_trace_raw(fmt, ...)					\
+	pr_info(SYMSPI_LOG_PREFIX""fmt"\n", ##__VA_ARGS__)
+#else
+#define symspi_trace(fmt, ...)
+#define symspi_trace_raw(fmt, ...)
+#endif
+
 
 // information messages levels
 #define SYMSPI_LOG_INFO_KEY_LEVEL 0
@@ -315,8 +385,27 @@
 		error_action;						\
 	}
 
+#define SYMSPI_CHECK_PTR(ptr, error_action)				\
+	if (IS_ERR_OR_NULL(ptr)) {					\
+		symspi_err("%s: pointer "# ptr" is invalid;\n"		\
+				, __func__);					\
+		error_action;						\
+	}
+
 #define __symspi_error_handle(err_no, sub_error_no)			\
 	__symspi_error_handle_(symspi, err_no, sub_error_no, __func__);
+
+// Init level section
+#define SYMSPI_INIT_LEVEL_PRIVATE_ALLOCATED 1
+#define SYMSPI_INIT_LEVEL_XFER_CREATED 2
+#define SYMSPI_INIT_LEVEL_WORKQUEUE_INIT 3
+#define SYMSPI_INIT_LEVEL_GPIO_IRQS 4
+#define SYMSPI_INIT_LEVEL_FULL 5
+
+#define __SYMSPI_INIT_LEVEL(level)							\
+	symspi->p->init_level = SYMSPI_INIT_LEVEL_##level;		\
+	symspi_info(SYMSPI_LOG_INFO_DBG_LEVEL					\
+			    , "current init level: "#level);
 
 /* -------------- BUILD TIME CONSTANTS SECTION ------------------------- */
 
@@ -354,6 +443,13 @@
 // (see @symspi_dev_private description)
 #define SYMSPI_PRIVATE_MAGIC 0x0E31553B
 
+// the root directory in proc file system, which contains
+// SymSPI information for user space
+#define SYMSPI_PROC_ROOT_NAME "symspi"
+// the name of the character device to readout SymSPI info
+#define SYMSPI_INFO_FILE_NAME "info"
+#define SYMSPI_PROC_R_PERMISSIONS 0444
+
 /* ------------------------ GLOBAL VARIABLES ----------------------------*/
 
 static struct symspi_dev *symspi_global_device_ptr = NULL;
@@ -365,6 +461,16 @@ static inline void __symspi_restart_timeout_timer(struct symspi_dev *symspi);
 static inline void __symspi_stop_timeout_timer(struct symspi_dev *symspi);
 static inline void __symspi_stop_timeout_timer_sync(struct symspi_dev *symspi);
 static void __symspi_other_side_wait_timeout(struct timer_list *t);
+static inline int __symspi_init_workqueue(
+		const struct symspi_dev *const symspi);
+static inline void __symspi_close_workqueue(
+		const struct symspi_dev *const symspi);
+static inline void __symspi_schedule_work(
+		const struct symspi_dev *const symspi
+		, struct work_struct *work);
+static inline void __symspi_cancel_work_sync(
+		const struct symspi_dev *const symspi
+		, struct work_struct *work);
 static inline bool __symspi_is_closing(struct symspi_dev *symspi);
 static int symspi_idle_to_xfer_prepare_sequence(struct full_duplex_xfer *xfer
 		, struct symspi_dev* symspi
@@ -421,6 +527,12 @@ static int symspi_to_idle_sequence(struct symspi_dev *symspi
 				   , const int original_state
 				   , bool start_next_xfer
 				   , const int internal_error);
+static inline int __symspi_procfs_init(struct symspi_dev *symspi);
+static inline void __symspi_procfs_close(struct symspi_dev *symspi);
+static inline int __symspi_info_init(struct symspi_dev *symspi);
+static void __symspi_info_close(struct symspi_dev *symspi);
+static ssize_t __symspi_info_read(struct file *file
+		, char __user *ubuf, size_t count, loff_t *ppos);
 static void symspi_spi_xfer_done_callback(void *context);
 static irqreturn_t symspi_their_flag_isr(int irq, void *symspi_device);
 static void symspi_their_flag_drop_isr_sequence(struct symspi_dev *symspi);
@@ -453,6 +565,10 @@ static const char SYMSPI_ERROR_S_IRQ_ACQUISITION[] = "";
 static const char SYMSPI_ERROR_S_ISR_SETUP[] = "";
 static const char SYMSPI_ERROR_S_WAIT_OTHER_SIDE[]
 		= "Timeout waiting for other side reaction.";
+#if SYMSPI_WQ_MODE_MATCH(PRIVATE)
+static const char SYMSPI_ERROR_S_WORKQUEUE_INIT[]
+		= "Failed to create own workqueue.";
+#endif
 
 /* --------------------- DATA STRUCTS SECTION ---------------------------*/
 
@@ -491,6 +607,23 @@ struct symspi_error_rec {
 	unsigned int err_per_sec_threshold;
 };
 
+// Tracks SymSPI statistics.
+// NOTE: due to performance reasons we can not introduce
+// 		any locking on the statistics, thus values are expected
+// 		to provide only big-picture information without pretending
+// 		to have exact precision.
+// @other_side_indicated_errors how many errors were indicated
+// 		by the other side
+// @xfers_done_ok how many raw SPI xfers were successfully finished
+// @their_flag_edges how many edges of the other side flag was
+//  	detected since startup
+struct symspi_info {
+	unsigned long long other_side_indicated_errors;
+	unsigned long long other_side_no_reaction_errors;
+	unsigned long long xfers_done_ok;
+	unsigned long long their_flag_edges;
+};
+
 // Opaque struct which is allocated and managed by SymSPI internally.
 //
 // OWNERSHIP:
@@ -508,6 +641,12 @@ struct symspi_error_rec {
 // @next_xfer_id keeps the next xfer id.
 //      should start from some positive number (@SYMSPI_INITIAL_XFER_ID).
 //      If wraps starts @SYMSPI_INITIAL_XFER_ID.
+// @work_queue pointer to personal SymSPI dedicated work-queue to handle
+//      communication jobs. It is used mainly for stability consderations
+//      cause publicitly available work-queue can potentially be blocked
+//      by other running/pending tasks. So to stay on a safe side we
+//      will allocate our own single-threaded workqueue for our purposes.
+//      NOTE: used only when SYMSPI_WORKQUEUE_MODE equals SYMSPI_WQ_PRIVATE
 // @xfer_work launches the xfer out of interrupt context.
 //      Not used for now, but this might be changed due to performance
 //      investigations.
@@ -568,6 +707,21 @@ struct symspi_error_rec {
 //      kernel message log in case of burst of errors, say due to
 //      high noise on the other side flag line; and also to track
 //      overall error statistics)
+// @init_level contains the SYMSPI_INIT_LEVEL_* value which tells the
+//      close routine from which point do we need a cleanup started.
+// @proc_root the root SymSPI directory in the proc file system
+//      this directory is now aiming to provide SymSPI runtime
+//      information but later might be used to set some SymSPI
+//      parameters dynamically.
+// @info_file the file in proc fs which provides the SymSPI
+//      info to user space.
+// @info_ops defines info file operations to call upon request
+//      from user space
+// @info tracks representation of current status of SymSPI
+//      from performance POV (error statistics, data statistics)
+//      and also its configuration.
+//      NOTE: it is filled with 0 at each start, so keep it in such
+//          a way that 0 is a correct initial value.
 struct symspi_dev_private {
 	struct symspi_dev *symspi;
 
@@ -576,6 +730,10 @@ struct symspi_dev_private {
 
 	struct spi_transfer spi_xfer;
 	struct spi_message spi_msg;
+
+#if SYMSPI_WQ_MODE_MATCH(PRIVATE)
+	struct workqueue_struct *work_queue;
+#endif
 
 	struct work_struct xfer_work;
 	struct work_struct postprocessing_work;
@@ -601,6 +759,14 @@ struct symspi_dev_private {
 	unsigned int magic;
 
 	struct symspi_error_rec errors[SYMSPI_ERROR_TYPES_COUNT];
+
+	uint8_t init_level;
+
+	struct proc_dir_entry *proc_root;
+	struct proc_dir_entry *info_file;
+	struct file_operations info_ops;
+
+	struct symspi_info info;
 };
 
 
@@ -772,6 +938,7 @@ int symspi_default_data_update(void __kernel *device
 //      SYMSPI_ERROR_NO_MEMORY
 //      SYMSPI_ERROR_IRQ_ACQUISITION
 //      SYMSPI_ERROR_ISR_SETUP
+//      SYMSPI_ERROR_WORKQUEUE_INIT
 //
 __maybe_unused
 int symspi_init(void __kernel *device
@@ -800,11 +967,12 @@ int symspi_init(void __kernel *device
 	}
 
 	symspi->p = kzalloc(sizeof(struct symspi_dev_private), GFP_KERNEL);
-
 	if (!symspi->p) {
-		symspi_err("Failed to allocate the private part of device.");
+		symspi_err("Failed to allocate the private part of device. Abort!");
+		symspi_close((void*)symspi);
 		return -SYMSPI_ERROR_NO_MEMORY;
 	}
+	__SYMSPI_INIT_LEVEL(PRIVATE_ALLOCATED);
 
 	// initializing the fields of symspi private
 	symspi->p->magic = SYMSPI_PRIVATE_MAGIC;
@@ -820,7 +988,13 @@ int symspi_init(void __kernel *device
 	timer_setup(&symspi->p->wait_timeout_timer,
 		    __symspi_other_side_wait_timeout, 0);
 
-	symspi_xfer_init_copy(&symspi->p->current_xfer, default_xfer);
+	res = symspi_xfer_init_copy(&symspi->p->current_xfer, default_xfer);
+	if (res < 0) {
+		symspi_err("Failed to init new xfer, error: %d. Abort!", -res);
+		symspi_close((void*)symspi);
+		return res;
+	};
+	__SYMSPI_INIT_LEVEL(XFER_CREATED);
 	symspi->p->current_xfer.xfers_counter = 0;
 	symspi->p->current_xfer.id = symspi_get_next_xfer_id(symspi);
 	default_xfer->xfers_counter = symspi->p->current_xfer.xfers_counter;
@@ -846,10 +1020,19 @@ int symspi_init(void __kernel *device
 	symspi->p->spi_msg.complete = &symspi_spi_xfer_done_callback;
 	symspi->p->spi_msg.context = (void*)symspi;
 
+	// init workqueue to be used
+	res = __symspi_init_workqueue(symspi);
+	if (res < 0) {
+		symspi_err("Failed to init SymSPI private workqueue"
+				   ", error: %d. Abort!", -res);
+		symspi_close((void*)symspi);
+		return -SYMSPI_ERROR_WORKQUEUE_INIT;
+	}
 	// works init
 	INIT_WORK(&symspi->p->xfer_work, symspi_do_xfer_work_wrapper);
 	INIT_WORK(&symspi->p->postprocessing_work, symspi_postprocessing_sequence);
 	INIT_WORK(&symspi->p->recover_work, symspi_recovery_sequence_wrapper);
+	__SYMSPI_INIT_LEVEL(WORKQUEUE_INIT);
 
 	// still cold for now
 	symspi->p->state = SYMSPI_STATE_COLD;
@@ -873,13 +1056,20 @@ int symspi_init(void __kernel *device
 	// init gpio IRQs
 	res = symspi_init_gpio_irqs(symspi);
 	if (res != SYMSPI_SUCCESS) {
+		symspi_err("Failed to init SymSPI GPIO IRQs"
+				   ", error: %d. Abort!", -res);
 		symspi_close((void*)symspi);
 		return res;
 	}
+	__SYMSPI_INIT_LEVEL(GPIO_IRQS);
+
+	__symspi_procfs_init(symspi);
+	__symspi_info_init(symspi);
 
 	// Make it run. Starting from that point
 	// we go to normal workflow.
 	// TODO: verify close_request sequence
+	__SYMSPI_INIT_LEVEL(FULL);
 	symspi->p->close_request = false;
 	symspi->p->state = SYMSPI_STATE_IDLE;
 
@@ -912,18 +1102,17 @@ int symspi_init(void __kernel *device
 //          -ENODEV: broken device data, or device data pointer
 //          -EALREADY: the device is already closing
 //      <0: negated error code on error
-//
-// TODO: to verify that it can be called safely also on closed device
 __maybe_unused
 int symspi_close(void __kernel *device)
 {
 	struct symspi_dev *symspi = (struct symspi_dev *)device;
-	if (IS_ERR_OR_NULL(symspi) || IS_ERR_OR_NULL(symspi->p)) {
-		symspi_err("got broken device data/pointer; can't close;");
-		return -ENODEV;
-	}
+	SYMSPI_CHECK_DEVICE_AND_PRIVATE("can't close;", return -ENODEV);
+
 	bool expected_state = false;
 	bool dst_state = true;
+	// NOTE: this will prevent all strict state switches (EXCEPT
+	//      leaving the XFER state), as well as API entries from
+	//      consumer code (EXCEPT for init and reset calls)
 	bool res = __atomic_compare_exchange_n(&symspi->p->close_request
 			, &expected_state, dst_state, false
 			, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
@@ -936,6 +1125,23 @@ int symspi_close(void __kernel *device)
 		return SYMSPI_SUCCESS;
 	}
 	symspi_info(SYMSPI_LOG_INFO_KEY_LEVEL, "closing started");
+
+	// we can be called with partially opened device,
+	// handling this here
+	switch(symspi->p->init_level) {
+	case SYMSPI_INIT_LEVEL_FULL: goto full;
+	case SYMSPI_INIT_LEVEL_GPIO_IRQS: goto gpio_irqs;
+	case SYMSPI_INIT_LEVEL_WORKQUEUE_INIT: goto workqueue_init;
+	case SYMSPI_INIT_LEVEL_XFER_CREATED: goto xfer_created;
+	case SYMSPI_INIT_LEVEL_PRIVATE_ALLOCATED: goto private_allocated;
+	default:
+		symspi_err("unknown init level: %d. Will still try to close."
+				   , symspi->p->init_level);
+	}
+
+full:
+	__symspi_info_close(symspi);
+	__symspi_procfs_close(symspi);
 
 	// at this point we have
 	// * prevented all entrypoints from consumer side (API)
@@ -959,9 +1165,9 @@ int symspi_close(void __kernel *device)
 				  SYMSPI_CLOSE_HW_WAIT_TIMEOUT_MSEC);
 		unsigned long res = wait_for_completion_timeout(
 				&symspi->p->final_leave_xfer_completion
-				, wait_jiffies );
+				, wait_jiffies);
 		if (res <= 0) {
-			symspi_warning("timeout waiting for SPI xfer"
+			symspi_err("timeout waiting for SPI xfer"
 				       " to be finished, will force"
 				       " abort.");
 
@@ -970,10 +1176,18 @@ int symspi_close(void __kernel *device)
 		}
 	}
 
-	// TODO: verify the close sequence
+	// Unless SPI transfer got frozen, we are effectively
+	// stopped already at this point - no state switches allowed,
+	// no API calls from this point (can be called but they do
+	// nothing), IRQs are also not doing anything.
 
+	__SYMSPI_INIT_LEVEL(GPIO_IRQS);
+
+gpio_irqs:
 	// remove ISRs, this also disables external error trigger
 	symspi_close_qpio_irqs(symspi);
+
+	symspi_our_flag_drop(symspi);
 
 	// close waiting timer
 	__symspi_stop_timeout_timer_sync(symspi);
@@ -986,13 +1200,27 @@ int symspi_close(void __kernel *device)
 			       " COLD state.");
 	}
 
+	// Unless SPI transfer got frozen,
+	// only workqueue queued works can bother us from this
+	// point, however, even those do nothing.
+
+	__SYMSPI_INIT_LEVEL(WORKQUEUE_INIT);
+
+workqueue_init:
 	// close async works
-	cancel_work_sync(&symspi->p->xfer_work);
-	cancel_work_sync(&symspi->p->postprocessing_work);
-	cancel_work_sync(&symspi->p->recover_work);
+	__symspi_cancel_work_sync(symspi, &symspi->p->xfer_work);
+	__symspi_cancel_work_sync(symspi, &symspi->p->postprocessing_work);
+	__symspi_cancel_work_sync(symspi, &symspi->p->recover_work);
 
-	symspi_our_flag_drop(symspi);
+	// wrap up with used workqueue
+	__symspi_close_workqueue(symspi);
 
+	__SYMSPI_INIT_LEVEL(XFER_CREATED);
+
+	// Unless SPI transfer stalled, all active entities are
+	// dead by now, and we can run raw resources cleanup.
+
+xfer_created:
 	// Spi_message doesn't point to any resources which
 	// are needed to be freed by us. SPI device is owned
 	// by consumer.
@@ -1003,6 +1231,9 @@ int symspi_close(void __kernel *device)
 	symspi_xfer_free(&symspi->p->current_xfer);
 	symspi_do_update_native_spi_xfer_data(symspi);
 
+	__SYMSPI_INIT_LEVEL(PRIVATE_ALLOCATED);
+
+private_allocated:
 	// returning symspi_dev to original state
 	symspi->p->magic = 0;
 	kfree(symspi->p);
@@ -1026,8 +1257,8 @@ bool symspi_is_running(void __kernel *device)
 
 // API:
 //
-// Restarts the interface. Should be called if SPI level were
-// errors encountered.
+// Restarts the interface. Should be called if SPI level
+// errors were encountered.
 // PARAMS:
 //      @default_xfer {valid xfer ptr || NULL when current_xfer is OK}
 //          defines the default xfer to be used. Can be NULL, then
@@ -1048,7 +1279,13 @@ int symspi_reset(void __kernel *device
 	struct symspi_dev *symspi = (struct symspi_dev *)device;
 	struct full_duplex_xfer tmp_xfer;
 	if (symspi_is_current_xfer_ok(symspi) && !default_xfer) {
-		symspi_xfer_init_copy(&tmp_xfer, &symspi->p->current_xfer);
+		int res = symspi_xfer_init_copy(&tmp_xfer
+										, &symspi->p->current_xfer);
+		if (res < 0) {
+			symspi_err("Failed to init xfer, error: %d. Abort!"
+						, -res);
+			return res;
+		}
 		default_xfer = &tmp_xfer;
 	}
 
@@ -1115,6 +1352,9 @@ static void __symspi_error_report_init(struct symspi_dev *symspi)
 	SYMSPI_ERR_REC(11, IRQ_ACQUISITION, 0);
 	SYMSPI_ERR_REC(12, ISR_SETUP, 0);
 	SYMSPI_ERR_REC(13, WAIT_OTHER_SIDE, 5);
+#if SYMSPI_WQ_MODE_MATCH(PRIVATE)
+	SYMSPI_ERR_REC(14, WORKQUEUE_INIT, 0);
+#endif
 
 #undef SYMSPI_ERR_REC
 }
@@ -1220,13 +1460,13 @@ static bool __symspi_error_report(struct symspi_dev *symspi
 	                                     ? level_err : level_warn;
 
 	if (func_name) {
-		symspi_err_raw("SymSPI %s %u (avg. rate per sec: %d): "
-			       "%s (sub %s: %d), raised by %s"
+		symspi_err_raw("SymSPI %s %u (ARpS: %d): "
+			       "%s (sub %s: %d), by %s"
 			       , report_class_str, err_no
 			       , rate, e_ptr->err_msg
 			       , report_class_str, sub_error_no, func_name);
 	} else {
-		symspi_err_raw("SymSPI %s %u (avg. rate per sec: %d): "
+		symspi_err_raw("SymSPI %s %u (ARpS: %d): "
 			       "%s (sub %s: %d)"
 			       , report_class_str, err_no
 			       , rate, e_ptr->err_msg
@@ -1234,8 +1474,8 @@ static bool __symspi_error_report(struct symspi_dev *symspi
 	}
 
 	if (e_ptr->unreported_count > 0) {
-		symspi_err_raw("%s %d happened %d times since reporting"
-			       " %u msecs ago. Total count: %u."
+		symspi_err_raw("%s %d -> %d since "
+			       " %u msecs. Total: %u."
 			       , report_class_str, err_no
 			       , e_ptr->unreported_count
 			       , since_last_report_msec
@@ -1256,6 +1496,9 @@ static bool __symspi_error_report(struct symspi_dev *symspi
 //      subsystem error code)
 // @func_name {NULL || valid string pointer} function name where
 //      the error was raised
+//
+// CONTEXT:
+// 		can not sleep (must be callable from ISR context)
 static void __symspi_error_handle_(struct symspi_dev *symspi
 				  , unsigned char err_no
 				  , int sub_error_no
@@ -1266,9 +1509,15 @@ static void __symspi_error_handle_(struct symspi_dev *symspi
 		return;
 	}
 
+	// Update info/error statistics
+	if (err_no == SYMSPI_ERROR_OTHER_SIDE) {
+		symspi->p->info.other_side_indicated_errors += 1;
+	} else if (err_no == SYMSPI_ERROR_WAIT_OTHER_SIDE) {
+		symspi->p->info.other_side_no_reaction_errors += 1;
+	}
+
 	bool report = __symspi_error_report(symspi, err_no, sub_error_no
 					    , func_name);
-
 
 	// NOTE: if error happened while we are in XFER state, we will
 	//      wait until SPI layer ends its xfer and returns with callback
@@ -1335,7 +1584,7 @@ static void __symspi_error_handle_(struct symspi_dev *symspi
 			// not a direct call cause recovery should discard and wait
 			// for completion of the timer, which will cause the
 			// softlock if is called from timer handler
-			schedule_work(&symspi->p->recover_work);
+			__symspi_schedule_work(symspi, &symspi->p->recover_work);
 			return;
 		}
 
@@ -1352,7 +1601,7 @@ static void __symspi_error_handle_(struct symspi_dev *symspi
 			// Secondary call is needed due to possible races
 			// with symspi_spi_xfer_done_callback
 			if (SYMSPI_SWITCH_STRICT(POSTPROCESSING, ERROR)) {
-				schedule_work(&symspi->p->recover_work);
+				__symspi_schedule_work(symspi, &symspi->p->recover_work);
 			}
 			return;
 		}
@@ -1374,8 +1623,8 @@ static inline void __symspi_restart_timeout_timer(struct symspi_dev *symspi)
 	const unsigned long expiration_time_jf
 		= jiffies + msecs_to_jiffies(SYMSPI_THEIR_FLAG_WAIT_TIMEOUT_MSEC);
 	mod_timer(&symspi->p->wait_timeout_timer, expiration_time_jf);
-	symspi_info(SYMSPI_LOG_INFO_DBG_LEVEL
-		    , "Started(restarted) timeout timer: in %d ms, in %lu jiffies"
+	symspi_trace(
+		    "timer set: in %d ms, in %lu jiffies"
 		    " (at %lu jiffies), timer: %px, now: %lu jiffies"
 		    , SYMSPI_THEIR_FLAG_WAIT_TIMEOUT_MSEC
 		    , expiration_time_jf >= jiffies ? (expiration_time_jf - jiffies) : 0
@@ -1383,12 +1632,12 @@ static inline void __symspi_restart_timeout_timer(struct symspi_dev *symspi)
 		    , &symspi->p->wait_timeout_timer
 		    , jiffies);
 	if (timer_pending(&symspi->p->wait_timeout_timer)) {
-		symspi_info(SYMSPI_LOG_INFO_DBG_LEVEL
-			    , "timer status: pending at %lu jiffies, now: %lu jiffies"
+		symspi_trace(
+			    "timer status: pending at %lu jiffies, now: %lu jiffies"
 			    , symspi->p->wait_timeout_timer.expires
 			    , jiffies);
 	} else {
-		symspi_info(SYMSPI_LOG_INFO_DBG_LEVEL, "timer status: idle");
+		symspi_trace("timer status: idle");
 	};
 }
 
@@ -1400,7 +1649,7 @@ static inline void __symspi_restart_timeout_timer(struct symspi_dev *symspi)
 static inline void __symspi_stop_timeout_timer(struct symspi_dev *symspi)
 {
 	del_timer(&symspi->p->wait_timeout_timer);
-	symspi_info(SYMSPI_LOG_INFO_DBG_LEVEL, "Stopped timeout timer.");
+	symspi_trace("Timer stop");
 }
 
 // Helper.
@@ -1412,7 +1661,7 @@ static inline void __symspi_stop_timeout_timer(struct symspi_dev *symspi)
 static inline void __symspi_stop_timeout_timer_sync(struct symspi_dev *symspi)
 {
 	del_timer_sync(&symspi->p->wait_timeout_timer);
-	symspi_info(SYMSPI_LOG_INFO_DBG_LEVEL, "Stopped timeout timer (sync).");
+	symspi_trace("Timer stop (sync)");
 }
 
 
@@ -1425,6 +1674,88 @@ static void __symspi_other_side_wait_timeout(struct timer_list *t)
 	SYMSPI_CHECK_DEVICE_AND_PRIVATE("No device provided for recovery."
 					, return);
 	__symspi_error_handle(SYMSPI_ERROR_WAIT_OTHER_SIDE, 0);
+}
+
+// Helper.
+// Inits the workqueue which is to be used by SymSPI
+// in its current configuration. If we use system-provided
+// workqueu - does nothing.
+//
+// RETURNS:
+//      >= 0     - on success
+//      < 0     - negative error code
+//
+// ERRORS:
+//      SYMSPI_ERROR_WORKQUEUE_INIT
+static inline int __symspi_init_workqueue(
+		const struct symspi_dev *const symspi)
+{
+#if SYMSPI_WQ_MODE_MATCH(SYSTEM)
+	symspi_info(SYMSPI_LOG_INFO_KEY_LEVEL, "using system wq");
+	(void)symspi;
+	return SYMSPI_SUCCESS;
+#elif SYMSPI_WQ_MODE_MATCH(SYSTEM_HIGHPRI)
+	symspi_info(SYMSPI_LOG_INFO_KEY_LEVEL, "using system_highpri wq");
+	(void)symspi;
+	return SYMSPI_SUCCESS;
+#elif SYMSPI_WQ_MODE_MATCH(PRIVATE)
+	symspi_info(SYMSPI_LOG_INFO_KEY_LEVEL, "using private wq");
+	symspi->p->work_queue = alloc_workqueue("symspi", WQ_HIGHPRI, 0);
+
+	if (symspi->p->work_queue) {
+		return SYMSPI_SUCCESS;
+	} else {
+		symspi_err("%s: the private work queue init failed."
+				   , __func__);
+		return -SYMSPI_ERROR_WORKQUEUE_INIT;
+	}
+#endif
+}
+
+// Helper.
+// Closes the workqueue which was used by SymSPI
+// in its current configuration. If we use system-provided
+// workqueue - does nothing.
+static inline void __symspi_close_workqueue(
+		const struct symspi_dev *const symspi)
+{
+#if SYMSPI_WQ_MODE_MATCH(PRIVATE)
+	destroy_workqueue(symspi->p->work_queue);
+	symspi->p->work_queue = NULL;
+#else
+	(void)symspi;
+#endif
+}
+
+
+// Helper.
+// Wrapper over schedule_work(...) for queue selected by configuration.
+// Schedules SymSPI work to the target queue.
+static inline void __symspi_schedule_work(
+		const struct symspi_dev *const symspi
+		, struct work_struct *work)
+{
+#if SYMSPI_WQ_MODE_MATCH(SYSTEM)
+	(void)symspi;
+	schedule_work(work);
+#elif SYMSPI_WQ_MODE_MATCH(SYSTEM_HIGHPRI)
+	(void)symspi;
+	queue_work(system_highpri_wq, work);
+#elif SYMSPI_WQ_MODE_MATCH(PRIVATE)
+	queue_work(symspi->p->work_queue, work);
+#else
+#error no known SymSPI work queue mode defined
+#endif
+}
+
+// Helper.
+// Wrapper over cancel_work_sync(...) in case we will
+// need some custom queue operations on cancelling.
+static inline void __symspi_cancel_work_sync(
+		const struct symspi_dev *const symspi
+		, struct work_struct *work)
+{
+	cancel_work_sync(work);
 }
 
 // Helper.
@@ -1459,7 +1790,7 @@ static int symspi_idle_to_xfer_prepare_sequence(struct full_duplex_xfer *xfer
 			SYMSPI_STATE_IDLE, SYMSPI_STATE_XFER_PREPARE)) {
 		symspi_info(SYMSPI_LOG_INFO_DBG_LEVEL
 			    , "Xfer request while not in IDLE state."
-			    " Will enquene request.");
+			    " Will enqueue request.");
 		return -FULL_DUPLEX_ERROR_NOT_READY;
 	}
 
@@ -1510,6 +1841,7 @@ static int symspi_xfer_init_copy(struct full_duplex_xfer *target
 	symspi_xfer_init_empty(target);
 	symspi_do_resize_xfer(target, source->size_bytes);
 	if (target->size_bytes == 0) {
+		symspi_err("No memory for new xfer.");
 		return -SYMSPI_ERROR_NO_MEMORY;
 	}
 	memcpy(target->data_tx, source->data_tx, source->size_bytes);
@@ -1871,7 +2203,7 @@ static inline bool regions_overlap(void *r_1, size_t size_1
 //              - when xfer should be updated to recover from error
 //
 // RETURNS:
-//      > 0     - on success
+//      >= 0     - on success
 //      < 0     - negative error code
 //
 // ERRORS:
@@ -2069,16 +2401,16 @@ inline static bool symspi_switch_strict(void *symspi_dev_ptr,
 			, dst_state, false, __ATOMIC_SEQ_CST
 			, __ATOMIC_SEQ_CST);
 	if (res) {
-		symspi_info_raw(SYMSPI_LOG_INFO_DBG_LEVEL
-				, "Switched from %d to %d", (int)expected_state
+		symspi_trace_raw(
+				"Switched from %d to %d", (int)expected_state
 				, (int)dst_state);
 	} else {
-		symspi_info_raw(SYMSPI_LOG_INFO_DBG_LEVEL
-				, "Tried switch from %d to %d, but failed"
+		symspi_trace_raw(
+				"Tried switch from %d to %d, but failed"
 				, (int)expected_state
 				, (int)dst_state);
-		symspi_info_raw(SYMSPI_LOG_INFO_DBG_LEVEL
-				, "Current state: %d", (int)(*state_ptr));
+		symspi_trace_raw(
+				"Current state: %d", (int)(*state_ptr));
 	}
 	return res;
 }
@@ -2318,7 +2650,7 @@ static void symspi_our_flag_set(struct symspi_dev *symspi)
 #ifdef SYMSPI_DEBUG
 	SYMSPI_CHECK_DEVICE("No device provided.", return);
 #endif
-	symspi_info(SYMSPI_LOG_INFO_DBG_LEVEL, "Our flag SET.");
+	symspi_trace("Our flag SET.");
 	gpiod_set_raw_value(symspi->gpiod_our_flag
 			    , symspi->p->spi_master_mode
 			      ? SYMSPI_MASTER_FLAG_ACTIVE_VALUE
@@ -2334,7 +2666,7 @@ static void symspi_our_flag_drop(struct symspi_dev *symspi)
 #ifdef SYMSPI_DEBUG
 	SYMSPI_CHECK_DEVICE("No device provided.", return);
 #endif
-	symspi_info(SYMSPI_LOG_INFO_DBG_LEVEL, "Our flag DROP.");
+	symspi_trace("Our flag DROP.");
 	gpiod_set_raw_value(symspi->gpiod_our_flag
 			    , symspi->p->spi_master_mode
 			      ? !SYMSPI_MASTER_FLAG_ACTIVE_VALUE
@@ -2345,14 +2677,14 @@ static void symspi_our_flag_drop(struct symspi_dev *symspi)
 inline static bool symspi_their_flag_is_set(struct symspi_dev *symspi)
 {
 	// NOTE: we test against other side
-	symspi_info(SYMSPI_LOG_INFO_DBG_LEVEL, "Their flag raw value: %d"
+	symspi_trace("Their flag raw value: %d"
 		    , gpiod_get_raw_value(symspi->gpiod_their_flag));
 	if ((symspi->p->spi_master_mode ? SYMSPI_SLAVE_FLAG_ACTIVE_VALUE
 					: SYMSPI_MASTER_FLAG_ACTIVE_VALUE)
 			== gpiod_get_raw_value(symspi->gpiod_their_flag)) {
-		symspi_info(SYMSPI_LOG_INFO_DBG_LEVEL, "Their flag is SET");
+		symspi_trace("Their flag is SET");
 	} else {
-		symspi_info(SYMSPI_LOG_INFO_DBG_LEVEL, "Their flag is NOT SET");
+		symspi_trace("Their flag is NOT SET");
 	}
 	return (symspi->p->spi_master_mode ? SYMSPI_SLAVE_FLAG_ACTIVE_VALUE
 					   : SYMSPI_MASTER_FLAG_ACTIVE_VALUE)
@@ -2695,6 +3027,179 @@ static int symspi_to_idle_sequence(struct symspi_dev *symspi
 	return SYMSPI_SUCCESS;
 }
 
+// Helper. Inits the SymSPI procfs.
+// RETURNS:
+//      >= 0: on success,
+//      < 0: on failure (negated error code)
+static inline int __symspi_procfs_init(struct symspi_dev *symspi)
+{
+	SYMSPI_CHECK_DEVICE_AND_PRIVATE("", return -ENODEV);
+
+	symspi->p->proc_root = proc_mkdir(SYMSPI_PROC_ROOT_NAME, NULL);
+
+	if (IS_ERR_OR_NULL(symspi->p->proc_root)) {
+		symspi_err("failed to create SymSPI proc root folder"
+			  " with name: "SYMSPI_PROC_ROOT_NAME);
+		return -EIO;
+	}
+	return 0;
+}
+
+// Closes the SymSPI proc root
+static inline void __symspi_procfs_close(struct symspi_dev *symspi)
+{
+	SYMSPI_CHECK_DEVICE_AND_PRIVATE("", return);
+
+	if (IS_ERR_OR_NULL(symspi->p->proc_root)) {
+		return;
+	}
+
+	proc_remove(symspi->p->proc_root);
+	symspi->p->proc_root = NULL;
+}
+
+// Helper. Initializes the info structure of SymSPI.
+// NOTE: the SymSPI proc rootfs should be created beforehand,
+//      if not: then we will fail to create info node.
+//
+// RETURNS:
+//      >= 0: on success,
+//      < 0: on failure (negated error code)
+static inline int __symspi_info_init(struct symspi_dev *symspi)
+{
+	SYMSPI_CHECK_DEVICE_AND_PRIVATE("", return -ENODEV);
+
+	// initial statistics data
+	memset(&symspi->p->info, 0, sizeof(symspi->p->info));
+
+	// info access operations
+	memset(&symspi->p->info_ops, 0, sizeof(symspi->p->info_ops));
+	symspi->p->info_ops.read  = &__symspi_info_read;
+	symspi->p->info_ops.owner = THIS_MODULE;
+
+	if (IS_ERR_OR_NULL(symspi->p->proc_root)) {
+		symspi_err("failed to create info proc entry:"
+			  " no SymSPI root proc entry");
+		symspi->p->info_file = NULL;
+		return -ENOENT;
+	}
+
+	symspi->p->info_file = proc_create_data(
+					   SYMSPI_INFO_FILE_NAME
+					   , SYMSPI_PROC_R_PERMISSIONS
+					   , symspi->p->proc_root
+					   , &symspi->p->info_ops
+					   , (void*)symspi);
+
+	if (IS_ERR_OR_NULL(symspi->p->info_file)) {
+		symspi_err("failed to create info proc entry.");
+		return -EIO;
+	}
+
+	return 0;
+}
+
+// Removes the SymSPI proc info file
+static void __symspi_info_close(struct symspi_dev *symspi)
+{
+	SYMSPI_CHECK_DEVICE_AND_PRIVATE("", return);
+
+	if (IS_ERR_OR_NULL(symspi->p->info_file)) {
+		return;
+	}
+
+	proc_remove(symspi->p->info_file);
+	symspi->p->info_file = NULL;
+}
+
+// Provides the read method for SymSPI info to user world.
+// Is invoked when user reads the /proc/<SYMSPI>/<INFO> file.
+//
+// Is restricted to the file size of SIZE_MAX bytes.
+//
+// RETURNS:
+//      >= 0: number of bytes actually provided to user space, on success
+//      < 0: negated error code, on failure
+//
+static ssize_t __symspi_info_read(struct file *file
+		, char __user *ubuf, size_t count, loff_t *ppos)
+{
+	SYMSPI_CHECK_PTR(file, return -EINVAL);
+	SYMSPI_CHECK_PTR(ubuf, return -EINVAL);
+	SYMSPI_CHECK_PTR(ppos, return -EINVAL);
+
+	struct symspi_dev *symspi = (struct symspi_dev *)PDE_DATA(file->f_inode);
+
+	SYMSPI_CHECK_DEVICE_AND_PRIVATE("", return -ENODEV);
+
+	const int BUFFER_SIZE = 2048;
+
+	if (*ppos >= BUFFER_SIZE || *ppos > SIZE_MAX) {
+		return 0;
+	}
+
+	char *buf = kmalloc(BUFFER_SIZE, GFP_KERNEL);
+
+	if (IS_ERR_OR_NULL(buf)) {
+		return -ENOMEM;
+	}
+
+	const struct symspi_info * const s = &symspi->p->info;
+	size_t len = (size_t)snprintf(buf, BUFFER_SIZE
+		     , "Statistics:\n"
+		       "other side indicated errors:  %llu\n"
+		       "other side no reaction errors:  %llu\n"
+		       "xfers done OK:  %llu\n"
+		       "their flag edges detected:  %llu\n"
+		       "\n"
+		       "Configuration:\n"
+			   "max xfer size: "
+			   macro_val_str(SYMSPI_XFER_SIZE_MAX_BYTES)
+			   " bytes\n"
+			   "our flag min inactive time: "
+               macro_val_str(SYMSPI_OUR_FLAG_INACTIVE_STATE_MIN_TIME_USEC)
+			   " us\n"
+			   "their flag wait timeout: "
+               macro_val_str(SYMSPI_THEIR_FLAG_WAIT_TIMEOUT_MSEC)
+			   " ms\n"
+			   "error recovery silence time: "
+               macro_val_str(SYMSPI_ERROR_RECOVERY_SILENCE_TIME_MS)
+			   " ms\n"
+			   "workqueue mode: "macro_val_str(SYMSPI_WORKQUEUE_MODE)"\n"
+			   "verbosity level: "macro_val_str(SYMSPI_VERBOSITY)"\n"
+		       "\n"
+		       "Note: statistical/monitoring"
+		       " info is not expeted to be used in precise"
+		       " measurements due to atomic selfconsistency"
+		       " maintenance would put overhead in the driver.\n"
+			, s->other_side_indicated_errors
+			, s->other_side_no_reaction_errors
+			, s->xfers_done_ok
+			, s->their_flag_edges
+		);
+	len++;
+
+	if (len > BUFFER_SIZE) {
+		symspi_warning("statistics output was too big for buffer"
+			      ", required length: %zu", len);
+		len = BUFFER_SIZE;
+		buf[BUFFER_SIZE - 1] = 0;
+	}
+
+	const unsigned long nbytes_to_copy
+			= (len >= (size_t)(*ppos))
+				?  min(len - (size_t)(*ppos), count)
+				: 0;
+	const unsigned long not_copied
+			= copy_to_user(ubuf, buf + (size_t)(*ppos)
+				       , nbytes_to_copy);
+	kfree(buf);
+	buf = NULL;
+	*ppos += nbytes_to_copy - not_copied;
+
+	return nbytes_to_copy - not_copied;
+}
+
 
 /* ----------------------- SPI CALLBACKS SECTION ----------------------- */
 
@@ -2735,12 +3240,15 @@ static void symspi_spi_xfer_done_callback(void *context)
 		return;
 	}
 
+	// update overview info
+	symspi->p->info.xfers_done_ok += 1;
+
 	// all went fine
 	// we'll shedule the data processing
 	// cause we can not run potentially heavy
 	// and unreliable routine within context
 	// which can't sleep
-	schedule_work(&symspi->p->postprocessing_work);
+	__symspi_schedule_work(symspi, &symspi->p->postprocessing_work);
 }
 
 
@@ -2786,7 +3294,7 @@ static irqreturn_t symspi_their_flag_isr(int irq, void *symspi_device)
 #ifdef SYMSPI_DEBUG
 	SYMSPI_CHECK_DEVICE("No device provided.", return IRQ_HANDLED);
 #endif
-	symspi_info(SYMSPI_LOG_INFO_DBG_LEVEL, "Their flag ISR.");
+	symspi_trace("Their flag ISR.");
 
 	if (symspi->p->state == SYMSPI_STATE_COLD) {
 		return IRQ_HANDLED;
@@ -2797,6 +3305,9 @@ static irqreturn_t symspi_their_flag_isr(int irq, void *symspi_device)
 	} else {
 		symspi_their_flag_drop_isr_sequence(symspi);
 	}
+
+	// track in info
+	symspi->p->info.their_flag_edges += 1;
 
 	return IRQ_HANDLED;
 }
@@ -3010,7 +3521,7 @@ EXPORT_SYMBOL(symspi_iface);
 
 
 
-// TODO[Harald]: Driver data can be usually stored in a
+// TODO[Harald comment]: Driver data can be usually stored in a
 // field of the spi_device struct itself by using
 // spi_set_drvdata(spi, symspi_dev); In other functions you can get it by
 // struct symspi_dev* pdata = spi_get_drvdata(spi);

@@ -46,3 +46,29 @@ config BOSCH_SYMSPI_TEST_MODULE
     depends on BOSCH_SYMSPI
     ---help---
         This flag enables the SYMSPI test module.
+
+config BOSCH_SYMSPI_THEIR_FLAG_WAIT_TIMEOUT_MSEC
+    int "Max other side reaction time [ms]"
+    default 60
+    range 20 1000
+    depends on BOSCH_SYMSPI
+    ---help---
+        Defines how much time we will wait for other side
+        reaction [ms], before starting the error recovery
+        sequence
+
+config BOSCH_SYMSPI_WORKQUEUE_MODE
+    int "SymSPI WQ mode: 0 - system, 1 - system-highprio, 2 - private-highprio"
+    default 2
+    range 0 2
+    depends on BOSCH_SYMSPI
+    ---help---
+        Defines which workqueue SymSPI should use to process the
+        incoming data, valid values:
+        0 - use the global system workqueue,
+        1 - use the global system high priority workqueue,
+        2 - use private high priority workqueue,
+        The higher the value the higher priority an less
+        dependencies SymSPI data processing will have. Use
+        higher value when SymSPI processes time-critical information
+        and shall not be blocked by other system facilities.
